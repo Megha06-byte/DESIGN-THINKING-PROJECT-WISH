@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Child Safety Tracking Dashboard</title>
+
+<style>
+body{
+    font-family: Arial,sans-serif;
+    background:#f5f5f5;
+    text-align:center;
+}
+
+#canvas{
+    background:white;
+    border:1px solid #ccc;
+    margin-top:20px;
+}
+
+#status{
+    width:500px;
+    margin:20px auto;
+    background:white;
+    padding:15px;
+    border-radius:10px;
+    box-shadow:0 0 10px rgba(0,0,0,0.1);
+    text-align:left;
+    font-size:20px;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Child Safety Tracking Demo</h1>
+
+<canvas id="canvas" width="1000" height="600"></canvas>
+
+<div id="status">
+
+<div><b>Simulation Clock:</b> <span id="simtime">t = 0 s</span></div>
+
+<div><b>Path Progress:</b> <span id="sample">0 / 7</span></div>
+
+<hr>
+
+<div><b>Zone:</b> <span id="zone">SAFE ZONE A</span></div>
+
+<div><b>Mode:</b> <span id="mode">LOW POWER</span></div>
+
+<div><b>GPS:</b> <span id="gps">SLEEP</span></div>
+
+<div><b>LoRa:</b> <span id="lora">PERIODIC</span></div>
+
+<hr>
+
+<div><b>LED11 (Deviation):</b> <span id="led11">OFF</span></div>
+
+<div><b>LED12 (Power):</b> <span id="led12">SLOW BLINK</span></div>
+
+<div><b>LED13 (Geofence):</b> <span id="led13">OFF</span></div>
+
+<hr>
+
+<div><b>Current State:</b> <span id="state">LOW POWER (SAFE ZONE A)</span></div>
+
+</div>
+<h2>Event Log</h2>
+
+<div id="eventLog"
+     style="
+        width:700px;
+        height:180px;
+        margin:20px auto;
+        overflow-y:auto;
+        background:white;
+        border:1px solid #ccc;
+        padding:10px;
+        text-align:left;
+        font-family:monospace;
+     ">
+</div>
+
+
+<script>
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+// ---------------------------------------------------------------
+// SCREEN-SPACE ZONES (only used for drawing the green/blue circles
+// and the dashed/solid path lines on the canvas)
+// ---------------------------------------------------------------
+
+const safe_zone_A = {
+    x:150,
+    y:300,
+    r:120
+};
+
+const safe_zone_B = {
+    x:850,
+    y:300,
+    r:100
+};
+
+const route = [
+[150,300],
+[165,302],
+[180,305],
+[195,309],
+[210,315],
+[225,323],
+[240,332],
+[255,343],
+[270,355],
+[290,370],
+[310,385],
+[330,400],
+[350,415],
+[375,430],
+[400,445],
+[430,455],
+[460,460],
+[490,455],
+[520,445],
+[550,430],
+[580,410],
+[610,390],
+[640,365],
+[670,340],
+[700,320],
+[735,305],
+[770,295],
+[805,292],
+[850,300]
+];
+
+const actualPath = [
+[150,300],
+[165,302],
+[180,305],
+[195,309],
+[210,315],
+[225,323],
+[240,332],
+[255,343],
+[270,355],
+[290,370],
+[310,385],
+[330,400],
+
+[360,360],
+[390,310],
+[430,260],
+[480,230],
+[540,220],
+
+[590,270],
+[640,320],
+[700,320],
+[735,305],
+[770,295],
+[805,292],
+[850,300]
+];
+
+// ---------------------------------------------------------------
+// ARDUINO-STYLE LOGIC (ported 1:1 from the MCU sketch)
+// Runs in its own coordinate space (logical units, not pixels)
+// so the detection math matches the firmware exactly.
+// ---------------------------------------------------------------
+
+// Safe zones
+const NUM_ZONES = 2;
+const safe_x = [0, 100];
+const safe_y = [0, 100];
+const safe_r = [40, 30];
+
+// Actual path followed by child (non-linear) - logical coords
+const NUM_POINTS = 24;
+
+const path_x = [
+5,8,11,14,17,20,
+23,26,29,32,35,38,
+
+45,52,60,70,80,
+
+75,72,78,85,92,97,100
+];
+
+const path_y = [
+5,8,12,15,20,24,
+28,33,38,44,50,56,
+
+50,42,35,30,25,
+
+45,65,80,92,98,100,100
+];
+
+// Expected route (non-linear) - logical coords
+const ROUTE_POINTS = 24;
+
+const route_x = [
+5,8,11,14,17,20,
+23,26,29,32,35,38,
+42,46,50,55,60,65,
+70,75,80,85,92,100
+];
+
+const route_y = [
+5,8,12,15,20,24,
+28,33,38,44,50,56,
+62,68,74,80,86,90,
+94,97,99,100,100,100
+];
+
+// Allowed deviation radius from expected route
+const PATH_RADIUS = 10;
+
+// Mutable state (mirrors the global variables in the .ino file)
+let curr_idx = 0;
+let deviationCount = 0;
+let lowPowerMode = false;
+let safeCounter = 0;
+
+// digitalWrite() targets - simulated pin states instead of real GPIOs
+let pin13 = "LOW";  // geofence LED
+let pin12 = "LOW";  // power LED
+let pin11 = "LOW";  // deviation LED
+
+function digitalWrite(pin, value)
+{
+    if(pin === 13) pin13 = value;
+    if(pin === 12) pin12 = value;
+    if(pin === 11) pin11 = value;
+}
+
+function isWithinRadius(px, py, cx, cy, radius)
+{
+    let dx = px - cx;
+    let dy = py - cy;
+    return (dx * dx + dy * dy) <= (radius * radius);
+}
+
+// Returns which zone index the point falls in, or -1 if none.
+// (detect() in the .ino only needed a bool; the dashboard also
+// wants to know WHICH zone, so this small helper is added.)
+function getZoneIndex(curr_x, curr_y)
+{
+    for(let i = 0; i < NUM_ZONES; i++)
+    {
+        if(isWithinRadius(curr_x, curr_y,
+                           safe_x[i], safe_y[i],
+                           safe_r[i]))
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+function detect(curr_x, curr_y)
+{
+    let insideSafeZone = (getZoneIndex(curr_x, curr_y) !== -1);
+
+    if(insideSafeZone)
+        digitalWrite(13, "LOW");   // Safe
+    else
+        digitalWrite(13, "HIGH");  // Alert
+
+    // Compare current point with corresponding expected waypoint
+    let withinPathRadius = isWithinRadius(curr_x, curr_y,
+                                           route_x[curr_idx],
+                                           route_y[curr_idx],
+                                           PATH_RADIUS);
+
+    if(withinPathRadius)
+    {
+        deviationCount = 0;
+    }
+    else
+    {
+        deviationCount++;
+    }
+
+    // Alert only after 3 consecutive deviations
+    if(deviationCount > 2)
+    {
+        digitalWrite(11, "HIGH");
+    }
+    else
+    {
+        digitalWrite(11, "LOW");
+    }
+}
+
+function power_manage(curr_x, curr_y)
+{
+    let insideSafeZone = (getZoneIndex(curr_x, curr_y) !== -1);
+
+    if(insideSafeZone)
+        safeCounter++;
+    else
+        safeCounter = 0;
+
+    lowPowerMode = (safeCounter >= 3);
+}
+
+// ---------------------------------------------------------------
+// DASHBOARD WIRING
+// Reads only the outputs of detect()/power_manage() (pin states,
+// lowPowerMode, zone index) - no zone/state strings are decided
+// here, they are derived from those outputs.
+// ---------------------------------------------------------------
+
+let simTime = 0;
+let idx = 0; // drives the canvas animation; mirrors curr_idx after each step
+let previousZone = "";
+let previousDeviation = false;
+
+function dist(x1,y1,x2,y2)
+{
+    return Math.sqrt(
+        (x1-x2)*(x1-x2)+
+        (y1-y2)*(y1-y2)
+    );
+}
+function logEvent(msg)
+{
+    const log = document.getElementById("eventLog");
+
+    log.innerHTML +=
+        "[t = " + simTime + "s] " +
+        msg +
+        "<br>";
+
+    log.scrollTop = log.scrollHeight;
+}
+function draw()
+{
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // SAFE_ZONE Zone
+    ctx.fillStyle="rgba(0,255,0,0.15)";
+    ctx.beginPath();
+    ctx.arc(safe_zone_A.x,safe_zone_A.y,safe_zone_A.r,0,2*Math.PI);
+    ctx.fill();
+
+    ctx.strokeStyle="green";
+    ctx.lineWidth=3;
+    ctx.stroke();
+
+    // safe_zone Zone
+    ctx.fillStyle="rgba(0,100,255,0.15)";
+    ctx.beginPath();
+    ctx.arc(safe_zone_B.x,safe_zone_B.y,safe_zone_B.r,0,2*Math.PI);
+    ctx.fill();
+
+    ctx.strokeStyle="blue";
+    ctx.lineWidth=3;
+    ctx.stroke();
+
+    // Expected Route
+    ctx.beginPath();
+    ctx.strokeStyle="green";
+    ctx.setLineDash([10,10]);
+
+    ctx.moveTo(route[0][0],route[0][1]);
+
+    for(let i=1;i<route.length;i++)
+    {
+        ctx.lineTo(route[i][0],route[i][1]);
+    }
+
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Actual Path
+    ctx.beginPath();
+    ctx.strokeStyle="red";
+    ctx.lineWidth=4;
+
+    ctx.moveTo(actualPath[0][0],actualPath[0][1]);
+
+    for(let i=1;i<=idx;i++)
+    {
+        ctx.lineTo(actualPath[i][0],actualPath[i][1]);
+    }
+
+    ctx.stroke();
+
+    let screenX = actualPath[idx][0];
+    let screenY = actualPath[idx][1];
+
+    // --- Run the Arduino-ported logic on the logical-space point ---
+    let logical_x = path_x[curr_idx];
+    let logical_y = path_y[curr_idx];
+
+    detect(logical_x, logical_y);
+    power_manage(logical_x, logical_y);
+
+    // --- Derive dashboard text purely from logic outputs ---
+    let zoneIdx = getZoneIndex(logical_x, logical_y);
+    let currentZone;
+
+if(zoneIdx === 0)
+{
+    currentZone = "SAFE ZONE A";
+}
+else if(zoneIdx === 1)
+{
+    currentZone = "SAFE ZONE B";
+}
+else
+{
+    currentZone = "TRANSIT";
+}
+if(currentZone !== previousZone)
+{
+    if(previousZone !== "")
+    {
+        logEvent(previousZone + " LEFT");
+    }
+
+    logEvent(currentZone + " ENTERED");
+
+    previousZone = currentZone;
+}
+    let inSafeZone = (zoneIdx !== -1);
+    let deviating = (pin11 === "HIGH");
+    if(deviating && !previousDeviation)
+{
+    logEvent("ROUTE DEVIATION DETECTED");
+}
+
+if(!deviating && previousDeviation)
+{
+    logEvent("ROUTE RETURNED TO EXPECTED PATH");
+}
+
+previousDeviation = deviating;
+    let zone, mode, gps, lora, led11, led12, led13, state, color;
+
+    led11 = (pin11 === "HIGH") ? "ON" : "OFF";
+    led13 = (pin13 === "HIGH") ? "ON" : "OFF";
+
+    if(deviating)
+    {
+        // Route deviation overrides zone display, same as detect()
+        // raising pin11 independently of the safe-zone pin13 check
+        state = "ROUTE DEVIATION ALERT";
+        zone = "TRANSIT";
+        mode = "ALERT";
+        gps = "ACTIVE";
+        lora = "ACTIVE";
+        color = "red";
+    }
+    else if(inSafeZone)
+    {
+        // zoneIdx 0 = safe_zone_A, zoneIdx 1 = safe_zone in the safe_x/safe_y arrays
+        zone = (zoneIdx === 0) ? "SAFE ZONE A" : "SAFE ZONE B";
+        state = "LOW POWER (" + zone + ")";
+        mode = lowPowerMode ? "LOW POWER" : "NORMAL";
+        gps = "SLEEP";
+        lora = "PERIODIC";
+        color = (zoneIdx === 0) ? "green" : "blue";
+    }
+    else
+    {
+        zone = "TRANSIT";
+        state = "NORMAL";
+        mode = lowPowerMode ? "LOW POWER" : "NORMAL";
+        gps = "ACTIVE";
+        lora = "ACTIVE";
+        color = "orange";
+    }
+
+    // LED12 blink pattern mirrors the loop()'s lowPowerMode branch
+    led12 = lowPowerMode ? "SLOW BLINK" : "FAST BLINK";
+
+    // Dashboard Update
+    document.getElementById("simtime").textContent =
+        "t = " + simTime + " s";
+
+    document.getElementById("sample").textContent =
+        idx + " / " + (actualPath.length - 1);
+
+    document.getElementById("zone").textContent =
+        zone;
+
+    document.getElementById("mode").textContent =
+        mode;
+
+    document.getElementById("gps").textContent =
+        gps;
+
+    document.getElementById("lora").textContent =
+        lora;
+
+    document.getElementById("led11").textContent =
+        led11;
+
+    document.getElementById("led12").textContent =
+        led12;
+
+    document.getElementById("led13").textContent =
+        led13;
+
+    document.getElementById("state").textContent =
+        state;
+
+    // Child Marker
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(screenX,screenY,14,0,2*Math.PI);
+    ctx.fill();
+
+    // Labels
+    ctx.fillStyle = "black";
+    ctx.font = "24px Arial";
+
+    ctx.fillText("SAFE ZONE A",60,120);
+    ctx.fillText("SAFE ZONE B",720,120);
+}
+logEvent("SIMULATION STARTED");
+draw();
+
+setInterval(() => {
+
+    simTime++;
+
+    idx++;
+    if(idx >= actualPath.length)
+    {
+        idx = 0;
+    }
+
+    // curr_idx mirrors idx but also drives the logical-space arrays,
+    // and resets deviationCount/safeCounter on wraparound exactly
+    // like loop() does in the .ino file
+    curr_idx++;
+    if(curr_idx >= NUM_POINTS)
+    {
+        curr_idx = 0;
+        deviationCount = 0; // restart simulation
+        safeCounter = 0;
+    }
+
+    draw();
+
+},500);
+
+</script>
+
+</body>
+</html>
